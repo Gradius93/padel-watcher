@@ -14,9 +14,9 @@
  *   NTFY_TOPIC   your private ntfy topic (if unset, notifications print to the console)
  *   STATE_FILE   where seen slots are stored (default .playtomic-state.json)
  *
- * Note: this uses Playtomic's undocumented app API (the same one the app/web
- * uses). It needs no login for search + availability, but it can change
- * without warning. Keep the polling interval polite (10–15 min).
+ * Note: this uses playtomic.com's undocumented web endpoints (club pages +
+ * /api/clubs/availability). They need no login but can change without
+ * warning. Keep the polling interval polite (10–15 min).
  */
 import { readFile, writeFile } from "node:fs/promises";
 
@@ -43,42 +43,37 @@ const CONFIG = {
     Sun: [["08:00", "16:00"]],
   } satisfies Record<Weekday, Window[]> as Record<Weekday, Window[]>,
   excludeTenantIds: [] as string[], // clubs you never want (ids shown by --list)
+  // Clubs are discovered by crawling "nearby clubs" links on playtomic.com club pages from these seeds
+  seedClubs: ["catford-padel-collective", "padel-padel-eltham", "padel-social-club-the-o2", "padel-box-bermondsey"],
+  crawlMarginKm: 4, // keep following links from clubs up to radiusKm + this
+  maxClubPages: 80,
+  clubCacheHours: 24,
   maxPerNotification: 8,
-  apiBase: process.env.PLAYTOMIC_API ?? "https://app.playtomic.io/api/v1",
+  site: process.env.PLAYTOMIC_SITE ?? "https://playtomic.com",
   ntfyTopic: process.env.NTFY_TOPIC ?? "",
   stateFile: process.env.STATE_FILE ?? ".playtomic-state.json",
-  concurrency: 4,
+  concurrency: 1,
+  requestDelayMs: 750, // playtomic.com's CloudFront returns 403 for a while if hit too fast
 };
 
 // ───────────────────────────── Types ──────────────────────────────
 
 interface Resource {
-  resource_id: string;
+  resourceId: string;
   name: string;
-  sport_id?: string;
-  properties?: { resource_type?: string; resource_size?: string };
-}
-
-interface Tenant {
-  tenant_id: string;
-  tenant_name: string;
-  address?: {
-    street?: string;
-    city?: string;
-    postal_code?: string;
-    coordinate?: { lat: number; lon: number };
-  };
-  resources?: Resource[];
+  sport: string;
+  features: string[]; // e.g. "indoor" | "outdoor", "double" | "single", "panoramic"
 }
 
 interface Availability {
   resource_id: string;
-  start_date: string; // YYYY-MM-DD
-  slots: { start_time: string; duration: number; price: string }[];
+  start_date: string; // YYYY-MM-DD (UTC)
+  slots: { start_time: string; duration: number; price: string }[]; // start_time is UTC
 }
 
 interface Club {
   id: string;
+  slug: string;
   name: string;
   distanceKm: number;
   postcode?: string;
@@ -103,19 +98,22 @@ const TZ = "Europe/London";
 const args = new Set(process.argv.slice(2));
 const LIST_MODE = args.has("--list");
 
-async function getJson<T>(url: string, attempts = 3): Promise<T> {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function getText(url: string, attempts = 3): Promise<string> {
   for (let i = 1; ; i++) {
     try {
+      await sleep(CONFIG.requestDelayMs);
       const res = await fetch(url, {
-        headers: { Accept: "application/json", "User-Agent": "padel-slot-watcher/1.0" },
+        headers: { "User-Agent": "padel-slot-watcher/1.0" },
         signal: AbortSignal.timeout(15_000),
       });
       if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status}`);
-      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status} for ${url}`), { fatal: true });
-      return (await res.json()) as T;
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status} for ${url}`), { fatal: true, status: res.status });
+      return await res.text();
     } catch (err) {
       if ((err as { fatal?: boolean }).fatal || i >= attempts) throw err;
-      await new Promise((r) => setTimeout(r, 1000 * 2 ** i));
+      await sleep(1000 * 2 ** i);
     }
   }
 }
@@ -128,6 +126,10 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
   return 6371 * 2 * Math.asin(Math.sqrt(h));
 }
 
+async function getJson<T>(url: string): Promise<T> {
+  return JSON.parse(await getText(url)) as T;
+}
+
 function londonDays(n: number) {
   const ymd = new Intl.DateTimeFormat("en-CA", { timeZone: TZ });
   const wd = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, weekday: "short" });
@@ -136,6 +138,10 @@ function londonDays(n: number) {
     return { date: ymd.format(d), weekday: wd.format(d) as Weekday };
   });
 }
+
+const londonYMD = new Intl.DateTimeFormat("en-CA", { timeZone: TZ });
+const londonWeekday = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, weekday: "short" });
+const londonHHMM = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false });
 
 function londonNowHHMM() {
   return new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
@@ -159,7 +165,12 @@ async function pool<T, R>(items: T[], size: number, fn: (item: T) => Promise<R>)
     Array.from({ length: Math.min(size, items.length) }, async () => {
       while (next < items.length) {
         const i = next++;
-        out[i] = await fn(items[i]);
+        try {
+          out[i] = await fn(items[i]);
+        } catch (err) {
+          next = items.length; // stop the other workers too
+          throw err;
+        }
       }
     }),
   );
@@ -168,67 +179,114 @@ async function pool<T, R>(items: T[], size: number, fn: (item: T) => Promise<R>)
 
 // ─────────────────────────── Playtomic ────────────────────────────
 
-async function findClubs(): Promise<Club[]> {
-  const { lat, lon } = CONFIG.home;
-  const url =
-    `${CONFIG.apiBase}/tenants?sport_id=PADEL&coordinate=${lat},${lon}` +
-    `&radius=${Math.round(CONFIG.radiusKm * 1000)}&size=50`;
-  const tenants = await getJson<Tenant[]>(url);
+function unescape(s: string) {
+  try {
+    return JSON.parse(`"${s}"`) as string;
+  } catch {
+    return s;
+  }
+}
 
-  return tenants
-    .filter((t) => t.address?.coordinate && !CONFIG.excludeTenantIds.includes(t.tenant_id))
-    .map((t) => ({
-      id: t.tenant_id,
-      name: t.tenant_name.trim(),
-      postcode: t.address?.postal_code,
-      distanceKm: haversineKm(CONFIG.home, t.address!.coordinate!),
-      courts: new Map((t.resources ?? []).filter((r) => !r.sport_id || r.sport_id === "PADEL").map((r) => [r.resource_id, r])),
-    }))
-    .filter((c) => c.distanceKm <= CONFIG.radiusKm && c.courts.size > 0)
-    .sort((a, b) => a.distanceKm - b.distanceKm);
+// Club pages embed the tenant (with coordinates + courts) in the Next.js payload as escaped JSON
+function parseClubPage(html: string) {
+  const text = html.replaceAll('\\"', '"');
+  const t = /"tenant":\{"tenant_id":"([^"]+)","tenant_name":"([^"]+)","slug":"([^"]+)","address":\{(.*?)"coordinate":\{"lat":([-\d.]+),"lon":([-\d.]+)\}/.exec(text);
+  if (!t) return null;
+  const courts = new Map<string, Resource>();
+  for (const m of text.matchAll(/\{"resourceId":"([^"]+)","name":"([^"]+)","sport":"([^"]+)","features":\[([^\]]*)\]/g)) {
+    const features = [...m[4].matchAll(/"([^"]+)"/g)].map((f) => f[1]);
+    if (m[3] === "PADEL") courts.set(m[1], { resourceId: m[1], name: unescape(m[2]), sport: m[3], features });
+  }
+  return {
+    id: t[1],
+    name: unescape(t[2]).trim(),
+    slug: t[3],
+    postcode: /"postal_code":"([^"]*)"/.exec(t[4])?.[1],
+    coordinate: { lat: Number(t[5]), lon: Number(t[6]) },
+    courts,
+    neighbours: [...new Set([...html.matchAll(/href="\/clubs\/([a-z0-9-]+)"/g)].map((m) => m[1]))],
+  };
+}
+
+async function crawlClubs(): Promise<Club[]> {
+  const queue = [...CONFIG.seedClubs];
+  const visited = new Set(queue);
+  const clubs: Club[] = [];
+
+  while (queue.length) {
+    const batch = queue.splice(0, CONFIG.concurrency);
+    const pages = await Promise.all(
+      batch.map(async (slug) => {
+        try {
+          return parseClubPage(await getText(`${CONFIG.site}/clubs/${slug}`));
+        } catch (err) {
+          // A dead link is fine; anything else (e.g. a 403 block) would cache an incomplete club list
+          if ((err as { status?: number }).status !== 404) throw err;
+          return null;
+        }
+      }),
+    );
+    for (const p of pages) {
+      if (!p) continue;
+      const distanceKm = haversineKm(CONFIG.home, p.coordinate);
+      if (distanceKm > CONFIG.radiusKm + CONFIG.crawlMarginKm) continue;
+      if (distanceKm <= CONFIG.radiusKm && p.courts.size) {
+        clubs.push({ id: p.id, slug: p.slug, name: p.name, postcode: p.postcode, distanceKm, courts: p.courts });
+      }
+      for (const n of p.neighbours) {
+        if (visited.has(n) || visited.size >= CONFIG.maxClubPages) continue;
+        visited.add(n);
+        queue.push(n);
+      }
+    }
+  }
+  return clubs;
+}
+
+// Club discovery is slow-changing, so reuse the crawled list from state for clubCacheHours
+async function findClubs(state: State | null): Promise<{ clubs: Club[]; clubsAt: string }> {
+  const fresh = state?.clubs && Date.now() - Date.parse(state.clubsAt ?? "") < CONFIG.clubCacheHours * 3_600_000;
+  const clubs = fresh
+    ? state!.clubs!.map((c) => ({ ...c, courts: new Map(c.courts.map((r) => [r.resourceId, r])) }))
+    : await crawlClubs();
+  return {
+    clubs: clubs.filter((c) => !CONFIG.excludeTenantIds.includes(c.id)).sort((a, b) => a.distanceKm - b.distanceKm),
+    clubsAt: fresh ? state!.clubsAt! : new Date().toISOString(),
+  };
 }
 
 async function clubSlots(club: Club, day: { date: string; weekday: Weekday }): Promise<Slot[]> {
-  const windows = CONFIG.windows[day.weekday];
-  if (!windows.length) return [];
+  const url = `${CONFIG.site}/api/clubs/availability?tenant_id=${club.id}&date=${day.date}&sport_id=PADEL`;
 
-  const url =
-    `${CONFIG.apiBase}/availability?sport_id=PADEL&tenant_id=${club.id}` +
-    `&local_start_min=${day.date}T00:00:00&local_start_max=${day.date}T23:59:59`;
-
-  let rows: Availability[];
-  try {
-    rows = await getJson<Availability[]>(url);
-  } catch (err) {
-    console.warn(`  ! ${club.name} ${day.date}: ${(err as Error).message}`);
-    return [];
-  }
-
-  const isToday = day.date === londonDays(1)[0].date;
+  const rows = await getJson<Availability[]>(url);
+  const today = londonDays(1)[0].date;
   const now = londonNowHHMM();
   const slots: Slot[] = [];
 
   for (const row of rows) {
     const court = club.courts.get(row.resource_id);
-    const size = court?.properties?.resource_size;
-    const type = court?.properties?.resource_type;
-    if (CONFIG.doublesOnly && size && size !== "double") continue;
-    if (CONFIG.indoorOnly && type && type !== "indoor") continue;
+    const features = court?.features ?? [];
+    if (CONFIG.doublesOnly && features.includes("single")) continue;
+    if (CONFIG.indoorOnly && features.includes("outdoor")) continue;
 
     for (const s of row.slots) {
-      const start = s.start_time.slice(0, 5);
+      // Availability times are UTC; convert to London local date/time
+      const at = new Date(`${row.start_date}T${s.start_time}Z`);
+      const date = londonYMD.format(at);
+      const weekday = londonWeekday.format(at) as Weekday;
+      const start = londonHHMM.format(at);
       if (!CONFIG.durations.includes(s.duration)) continue;
-      if (isToday && start <= now) continue;
-      if (!windows.some(([from, to]) => start >= from && start <= to)) continue;
+      if (date < today || (date === today && start <= now)) continue;
+      if (!CONFIG.windows[weekday].some(([from, to]) => start >= from && start <= to)) continue;
       if (CONFIG.maxPrice !== undefined && parseFloat(s.price) > CONFIG.maxPrice) continue;
 
       slots.push({
-        key: `${club.id}|${row.resource_id}|${row.start_date}|${start}|${s.duration}`,
+        key: `${club.id}|${row.resource_id}|${date}|${start}|${s.duration}`,
         club,
         court: court?.name ?? "Court",
-        indoor: type ? type === "indoor" : undefined,
-        date: row.start_date,
-        weekday: day.weekday,
+        indoor: features.includes("indoor") ? true : features.includes("outdoor") ? false : undefined,
+        date,
+        weekday,
         start,
         duration: s.duration,
         price: s.price,
@@ -240,17 +298,26 @@ async function clubSlots(club: Club, day: { date: string; weekday: Weekday }): P
 
 // ───────────────────────── State + notify ─────────────────────────
 
-async function loadSeen(): Promise<Set<string> | null> {
+type StoredClub = Omit<Club, "courts"> & { courts: Resource[] };
+
+interface State {
+  seen: string[];
+  clubs?: StoredClub[];
+  clubsAt?: string;
+}
+
+async function loadState(): Promise<State | null> {
   try {
-    const json = JSON.parse(await readFile(CONFIG.stateFile, "utf8")) as { seen: string[] };
-    return new Set(json.seen);
+    return JSON.parse(await readFile(CONFIG.stateFile, "utf8")) as State;
   } catch {
     return null; // first run
   }
 }
 
-async function saveSeen(keys: string[]) {
-  await writeFile(CONFIG.stateFile, JSON.stringify({ updatedAt: new Date().toISOString(), seen: keys }, null, 2));
+async function saveState(keys: string[], clubs: Club[], clubsAt: string) {
+  const stored: StoredClub[] = clubs.map((c) => ({ ...c, courts: [...c.courts.values()] }));
+  const state: State = { seen: keys, clubs: stored, clubsAt };
+  await writeFile(CONFIG.stateFile, JSON.stringify({ updatedAt: new Date().toISOString(), ...state }, null, 2));
 }
 
 function line(s: Slot) {
@@ -276,7 +343,7 @@ async function notify(slots: Slot[]) {
       Title: title,
       Tags: "tennis",
       Priority: slots.some((s) => s.date === londonDays(1)[0].date) ? "high" : "default",
-      Click: `https://app.playtomic.io/tenant/${shown[0].club.id}`,
+      Click: `${CONFIG.site}/clubs/${shown[0].club.slug}`,
     },
   });
   if (!res.ok) throw new Error(`ntfy failed: HTTP ${res.status}`);
@@ -285,7 +352,8 @@ async function notify(slots: Slot[]) {
 // ───────────────────────────── Main ───────────────────────────────
 
 async function main() {
-  const clubs = await findClubs();
+  const state = await loadState();
+  const { clubs, clubsAt } = await findClubs(state);
   if (!clubs.length) throw new Error("No Playtomic padel clubs found in range — try a bigger radiusKm.");
 
   if (LIST_MODE) {
@@ -295,7 +363,15 @@ async function main() {
 
   const days = londonDays(CONFIG.daysAhead);
   const jobs = clubs.flatMap((club) => days.map((day) => ({ club, day })));
-  const all = (await pool(jobs, CONFIG.concurrency, ({ club, day }) => clubSlots(club, day))).flat();
+  let found: Slot[];
+  try {
+    found = (await pool(jobs, CONFIG.concurrency, ({ club, day }) => clubSlots(club, day))).flat();
+  } catch (err) {
+    // Saving a partial result would make every missing slot look "new" on the next run
+    console.warn(`Playtomic request failed, keeping previous state: ${(err as Error).message}`);
+    return;
+  }
+  const all = [...new Map(found.map((s) => [s.key, s])).values()]; // UTC→local can put a slot under a neighbouring day's query
 
   all.sort((a, b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start) || a.club.distanceKm - b.club.distanceKm);
 
@@ -305,8 +381,9 @@ async function main() {
     return;
   }
 
-  const seen = await loadSeen();
-  await saveSeen(all.map((s) => s.key)); // only keep what's live now, so cancellations re-trigger
+  const seen = state ? new Set(state.seen) : null;
+  // only keep what's live now, so cancellations re-trigger
+  await saveState(all.map((s) => s.key), clubs, clubsAt);
 
   if (seen === null) {
     console.log(`First run: recorded ${all.length} existing slots as a baseline. You'll be notified about new ones from now on.`);
