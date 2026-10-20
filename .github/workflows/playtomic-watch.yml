@@ -4,7 +4,7 @@ name: Playtomic watcher
 
 on:
   schedule:
-    - cron: "*/15 6-22 * * *" # every 15 min, ~7am–11pm UK (cron is UTC)
+    - cron: "0 7 * * *" # daily at 07:00 UTC (08:00 UK in summer)
   workflow_dispatch:
 
 concurrency:
