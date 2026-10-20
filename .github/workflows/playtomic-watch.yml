@@ -1,0 +1,43 @@
+# Put this at .github/workflows/playtomic-watch.yml in a (private) repo
+# alongside playtomic-watch.ts, and add a repo secret NTFY_TOPIC.
+name: Playtomic watcher
+
+on:
+  schedule:
+    - cron: "*/15 6-22 * * *" # every 15 min, ~7am–11pm UK (cron is UTC)
+  workflow_dispatch:
+
+concurrency:
+  group: playtomic-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Seen-slot state carried between runs via the Actions cache
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: .playtomic-state.json
+          key: playtomic-state-${{ github.run_id }}
+          restore-keys: playtomic-state-
+
+      - name: Check for new slots
+        run: npx --yes tsx playtomic-watch.ts
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .playtomic-state.json
+          key: playtomic-state-${{ github.run_id }}
