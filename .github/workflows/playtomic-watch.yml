@@ -2,9 +2,8 @@
 # alongside playtomic-watch.ts, and add a repo secret NTFY_TOPIC.
 name: Playtomic watcher
 
+# Schedule disabled: playtomic.com returns 403 to GitHub runner IPs. Runs via launchd on a Mac instead (run-local.sh).
 on:
-  schedule:
-    - cron: "0 7 * * *" # daily at 07:00 UTC (08:00 UK in summer)
   workflow_dispatch:
 
 concurrency:
